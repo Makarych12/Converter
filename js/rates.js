@@ -8,7 +8,7 @@
  */
 
 import { CRYPTO, CURRENCIES } from './currencies.js';
-import { idbSet, lsGet, lsSet } from './storage.js';
+import { lsGet, lsSet } from './storage.js';
 
 const LS_RATES = 'convector:rates:v1';
 
@@ -113,8 +113,8 @@ export async function refreshRates(prev = loadCachedRates()) {
     },
   };
 
+  // Один снапшот — одна сериализация. Дубль в IndexedDB не нужен: localStorage читается синхронно при старте.
   lsSet(LS_RATES, snapshot);
-  idbSet('rates:latest', snapshot);
   return snapshot;
 }
 

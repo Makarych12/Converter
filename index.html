@@ -18,6 +18,12 @@
       var s = JSON.parse(localStorage.getItem('convector:state:v1') || '{}');
       if (s.theme === 'light' || s.theme === 'dark') document.documentElement.dataset.theme = s.theme;
     } catch (e) {}
+    // Лёгкий режим для телефонов и бюджетных устройств (Honor 20/40 Lite и т.п.):
+    // без backdrop-filter, анимаций фона и тяжёлых теней
+    var n = navigator, coarse = matchMedia('(hover: none), (pointer: coarse)').matches;
+    if (coarse || (n.deviceMemory && n.deviceMemory <= 4) || (n.hardwareConcurrency && n.hardwareConcurrency <= 4)) {
+      document.documentElement.classList.add('lite');
+    }
   </script>
   <link rel="stylesheet" href="css/styles.css">
   <script type="module" src="js/app.js"></script>

@@ -5,8 +5,11 @@
 const NS = 'http://www.w3.org/2000/svg';
 let gradientSeq = 0;
 
-/** Спарклайн как SVG-строка. Зелёный — рост, красный — падение. */
-export function sparklineSVG(values, { width = 120, height = 36 } = {}) {
+/**
+ * Спарклайн как SVG-строка. Зелёный — рост, красный — падение.
+ * Без анимаций, фильтров и теней; в режиме `lite` — без градиентной заливки (меньше узлов и растеризации).
+ */
+export function sparklineSVG(values, { width = 120, height = 36, lite = false } = {}) {
   if (!values || values.length < 2) {
     return `<svg viewBox="0 0 ${width} ${height}" class="spark spark--empty" aria-hidden="true"><line x1="0" x2="${width}" y1="${height / 2}" y2="${height / 2}" /></svg>`;
   }
@@ -18,8 +21,13 @@ export function sparklineSVG(values, { width = 120, height = 36 } = {}) {
   const pts = values.map((v, i) => [i * stepX, height - pad - ((v - min) / span) * (height - pad * 2)]);
   const d = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('');
   const up = values[values.length - 1] >= values[0];
-  const id = `sg${++gradientSeq}`;
   const last = pts[pts.length - 1];
+  if (lite) {
+    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="spark ${up ? 'is-up' : 'is-down'}" aria-hidden="true">
+    <path d="${d}" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+  }
+  const id = `sg${++gradientSeq}`;
   return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="spark ${up ? 'is-up' : 'is-down'}" aria-hidden="true">
     <defs><linearGradient id="${id}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="currentColor" stop-opacity=".28"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs>
     <path d="${d}L${width},${height}L0,${height}Z" fill="url(#${id})" stroke="none"/>
@@ -61,10 +69,22 @@ export class LineChart {
     this.tip.hidden = true;
     this.host.append(this.svg, this.tip);
 
-    this.ro = new ResizeObserver(() => this.render());
+    // Перерисовка только при реальном изменении размера (на мобильных скрытие адресной строки
+    // меняет высоту окна, но не размер графика)
+    this.size = '';
+    this.ro = new ResizeObserver(() => {
+      const size = `${this.host.clientWidth}x${this.host.clientHeight}`;
+      if (size !== this.size) this.render();
+    });
     this.ro.observe(this.host);
 
-    const move = (e) => this.hover(e);
+    // pointermove приходит чаще, чем кадры экрана — обрабатываем последнее событие раз за кадр
+    let frame = 0;
+    let lastEvent = null;
+    const move = (e) => {
+      lastEvent = e;
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; this.hover(lastEvent); });
+    };
     this.svg.addEventListener('pointermove', move);
     this.svg.addEventListener('pointerdown', move);
     this.svg.addEventListener('pointerleave', () => this.clearHover());
@@ -81,6 +101,7 @@ export class LineChart {
     const w = this.host.clientWidth;
     const h = this.host.clientHeight;
     if (!w || !h) return;
+    this.size = `${w}x${h}`;
     const svg = this.svg;
     svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
     svg.replaceChildren();

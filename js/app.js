@@ -8,7 +8,7 @@ import { loadCachedRates, refreshRates, convert, rateOf } from './rates.js';
 import { loadWeek, sparkValues, getPairSeries, PERIODS } from './history.js';
 import { sparklineSVG, LineChart } from './charts.js';
 import { copyToClipboard, showToast, ICON_COPY } from './clipboard.js';
-import { lsGet, lsSet } from './storage.js';
+import { lsGet, lsSetRaw } from './storage.js';
 
 /* ============================ Состояние ============================ */
 
@@ -26,6 +26,8 @@ const COPY_FORMATS = [
 ];
 
 const $ = (sel, root = document) => root.querySelector(sel);
+/** Лёгкий режим выставляется инлайн-скриптом в <head> (телефоны, ≤4 ГБ ОЗУ, ≤4 ядер). */
+const LITE = document.documentElement.classList.contains('lite');
 const valid = (code) => !!getCurrency(code);
 const up = (s) => String(s || '').trim().toUpperCase();
 
@@ -75,14 +77,33 @@ let week = null;
 let loading = false;
 let lastError = null;
 
+/** Выполнить в простое главного потока (с запасным setTimeout для Safari). */
+const idle = (fn, timeout = 1000) => ('requestIdleCallback' in window
+  ? requestIdleCallback(fn, { timeout })
+  : setTimeout(fn, 1));
+
 let saveTimer = 0;
+let savedJSON = '';
+let savedQuery = '';
+/**
+ * Сохранение состояния: с задержкой, в простое и только при реальных изменениях —
+ * никаких повторных JSON.stringify → localStorage на каждый символ.
+ */
 function persist() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(() => idle(() => {
     const { list, from, to, amount, text, copyFormat, period, theme } = state;
-    lsSet(LS_STATE, { list, from, to, amount, text, copyFormat, period, theme });
-    history.replaceState(null, '', `${location.pathname}${queryString(true)}${location.hash}`);
-  }, 250);
+    const json = JSON.stringify({ list, from, to, amount, text, copyFormat, period, theme });
+    if (json !== savedJSON) {
+      savedJSON = json;
+      lsSetRaw(LS_STATE, json);
+    }
+    const query = queryString(true);
+    if (query !== savedQuery) {
+      savedQuery = query;
+      history.replaceState(null, '', `${location.pathname}${query}${location.hash}`);
+    }
+  }), 400);
 }
 
 function sourcePlain() {
@@ -113,9 +134,35 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 /* ============================ Сетка карточек ============================ */
 
 const grid = $('#grid');
-/** @type {Map<string, {root: HTMLElement, input: HTMLInputElement, preview: HTMLElement, rate: HTMLElement, spark: HTMLElement, change: HTMLElement, role: HTMLElement, sparkKey?: string}>} */
+/** @type {Map<string, {code: string, root: HTMLElement, input: HTMLInputElement, preview: HTMLElement, rate: HTMLElement, spark: HTMLElement, change: HTMLElement, role: HTMLElement, visible: boolean, sparkKey?: string, metaKey?: string}>} */
 const cards = new Map();
 let editing = null; // код карточки в фокусе или 'main'
+
+/* --- Точечные записи в DOM: пишем только то, что реально изменилось (нет лишних style/layout) --- */
+function setText(el, text) {
+  if (el._text !== text) { el._text = text; el.textContent = text; }
+}
+function setValue(input, value) {
+  if (input.value !== value) input.value = value;
+}
+function setClass(el, cls, on) {
+  if (el.classList.contains(cls) !== on) el.classList.toggle(cls, on);
+}
+function setHTML(el, key, html) {
+  if (el._htmlKey !== key) { el._htmlKey = key; el.innerHTML = typeof html === 'function' ? html() : html; }
+}
+
+/* --- Ленивые спарклайны: рисуем только для карточек в зоне видимости --- */
+const sparkObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const entry = cards.get(e.target.dataset.code);
+      if (!entry) continue;
+      entry.visible = e.isIntersecting;
+      if (entry.visible) renderSpark(entry);
+    }
+  }, { rootMargin: '120px 0px' })
+  : null;
 
 function createCard(code) {
   const cur = getCurrency(code);
@@ -146,6 +193,7 @@ function createCard(code) {
     </div>`;
 
   const entry = {
+    code,
     root,
     input: $('.card__input', root),
     preview: $('.card__preview', root),
@@ -153,13 +201,14 @@ function createCard(code) {
     spark: $('.card__spark', root),
     change: $('.card__change', root),
     role: $('.card__role', root),
+    visible: !sparkObserver, // без IntersectionObserver — рисуем сразу
   };
 
   entry.input.addEventListener('focus', () => {
     editing = code;
     requestAnimationFrame(() => entry.input.select());
   });
-  entry.input.addEventListener('input', () => onSourceInput(code, entry.input.value, entry.preview));
+  entry.input.addEventListener('input', () => scheduleSourceInput(code, entry.input.value, entry.preview));
   entry.input.addEventListener('blur', () => commitInput(code, entry.input, entry.preview));
   entry.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') entry.input.blur();
@@ -175,18 +224,24 @@ function createCard(code) {
   $('.card__select', root).addEventListener('click', () => setTarget(code));
 
   cards.set(code, entry);
+  sparkObserver?.observe(root);
   return entry;
 }
 
 function renderGrid() {
   for (const [code, entry] of cards) {
-    if (!state.list.includes(code)) { entry.root.remove(); cards.delete(code); }
+    if (!state.list.includes(code)) {
+      sparkObserver?.unobserve(entry.root);
+      entry.root.remove();
+      cards.delete(code);
+    }
   }
+  // Один проход вставки через DocumentFragment — один reflow на всю сетку
   const frag = document.createDocumentFragment();
   for (const code of state.list) frag.append((cards.get(code) || createCard(code)).root);
   frag.append(addTile);
   grid.append(frag);
-  $('#grid-count').textContent = state.list.length;
+  setText($('#grid-count'), String(state.list.length));
   updateAll();
 }
 
@@ -196,47 +251,58 @@ addTile.className = 'card card--add';
 addTile.innerHTML = `<span class="card--add__plus" aria-hidden="true">+</span><span>Добавить валюту</span><kbd>/</kbd>`;
 addTile.addEventListener('click', () => openPicker('add'));
 
+/** Спарклайн карточки: цена 1 единицы карточки в исходной валюте за 7 дней. */
+function renderSpark(entry) {
+  if (!entry.visible) return; // невидимые карточки дорисуются при скролле
+  const { code } = entry;
+  const comparator = code === state.from ? (code === 'USD' ? 'EUR' : 'USD') : state.from;
+  const key = `${comparator}|${snapshot?.ts}|${week ? week.length : -1}`;
+  if (entry.sparkKey === key) return;
+  entry.sparkKey = key;
+  const values = week ? sparkValues(week, code, comparator, rates) : [];
+  entry.spark.innerHTML = sparklineSVG(values, { lite: LITE });
+  const ch = values.length > 1 ? (values[values.length - 1] / values[0] - 1) * 100 : NaN;
+  setText(entry.change, Number.isFinite(ch) ? `7д ${formatPercent(ch)}` : week ? '' : '…');
+  entry.change.className = `card__change ${ch > 0.005 ? 'is-up' : ch < -0.005 ? 'is-down' : ''}`;
+  entry.spark.title = `Курс 1 ${code} в ${comparator} за 7 дней`;
+}
+
+/**
+ * Обновление сетки. На каждый символ меняются только значения в полях;
+ * роли, курсы и спарклайны пересчитываются лишь при смене пары или курсов.
+ */
 function updateCards() {
-  for (const [code, entry] of cards) {
-    const cur = getCurrency(code);
+  const empty = state.text.trim() === '';
+  const metaKey = `${state.from}|${state.to}|${snapshot?.ts}`;
+  for (const entry of cards.values()) {
+    const { code } = entry;
     const isFrom = code === state.from;
-    entry.root.classList.toggle('is-from', isFrom);
-    entry.root.classList.toggle('is-to', code === state.to);
-    entry.role.textContent = isFrom ? 'Источник' : code === state.to ? 'Цель' : '';
-    entry.root.classList.toggle('is-missing', !rates[code]);
 
     if (editing !== code) {
       if (isFrom) {
-        entry.input.value = state.text;
+        setValue(entry.input, state.text);
       } else {
         const v = valueIn(code);
-        entry.input.value = state.text.trim() === '' ? '' : Number.isFinite(v) ? formatAmount(v, cur) : '';
-        entry.input.placeholder = Number.isFinite(v) ? '0' : '—';
+        setValue(entry.input, empty || !Number.isFinite(v) ? '' : formatAmount(v, getCurrency(code)));
       }
     }
 
-    // Курс в карточке: показываем «крупное» направление, чтобы не было 0,0000171
-    if (isFrom) {
-      entry.rate.textContent = 'Исходная сумма';
-    } else {
-      const r = rateOf(state.from, code, rates);
-      if (!Number.isFinite(r)) entry.rate.textContent = 'Нет курса';
-      else if (r < 0.01) entry.rate.textContent = `1 ${code} = ${formatRate(1 / r)} ${state.from}`;
-      else entry.rate.textContent = `1 ${state.from} = ${formatRate(r)} ${code}`;
-    }
+    if (entry.metaKey === metaKey) continue;
+    entry.metaKey = metaKey;
+    setClass(entry.root, 'is-from', isFrom);
+    setClass(entry.root, 'is-to', code === state.to);
+    setClass(entry.root, 'is-missing', !rates[code]);
+    setText(entry.role, isFrom ? 'Источник' : code === state.to ? 'Цель' : '');
+    if (!isFrom) entry.input.placeholder = rates[code] ? '0' : '—';
 
-    // Спарклайн: цена 1 единицы карточки в исходной валюте за 7 дней
-    const comparator = isFrom ? (code === 'USD' ? 'EUR' : 'USD') : state.from;
-    const key = `${comparator}|${snapshot?.ts}|${week ? week.length : 0}`;
-    if (entry.sparkKey !== key) {
-      entry.sparkKey = key;
-      const values = week ? sparkValues(week, code, comparator, rates) : [];
-      entry.spark.innerHTML = sparklineSVG(values);
-      const ch = values.length > 1 ? (values[values.length - 1] / values[0] - 1) * 100 : NaN;
-      entry.change.textContent = Number.isFinite(ch) ? `7д ${formatPercent(ch)}` : week ? '' : '…';
-      entry.change.className = `card__change ${ch > 0.005 ? 'is-up' : ch < -0.005 ? 'is-down' : ''}`;
-      entry.spark.title = `Курс 1 ${code} в ${comparator} за 7 дней`;
-    }
+    // Курс в карточке: показываем «крупное» направление, чтобы не было 0,0000171
+    const r = rateOf(state.from, code, rates);
+    setText(entry.rate, isFrom ? 'Исходная сумма'
+      : !Number.isFinite(r) ? 'Нет курса'
+      : r < 0.01 ? `1 ${code} = ${formatRate(1 / r)} ${state.from}`
+      : `1 ${state.from} = ${formatRate(r)} ${code}`);
+
+    renderSpark(entry);
   }
 }
 
@@ -244,6 +310,13 @@ function updateCards() {
 
 const amountInput = $('#amount');
 const amountPreview = $('#amount-preview');
+const fromPill = $('#from-pill');
+const toPill = $('#to-pill');
+const resultEl = $('#result');
+resultEl.innerHTML = '<span class="result__value"></span><span class="result__code"></span>';
+const resultValue = $('.result__value', resultEl);
+const resultCode = $('.result__code', resultEl);
+const rateLine = $('#rate-line');
 
 function pillHTML(code) {
   const cur = getCurrency(code);
@@ -252,39 +325,57 @@ function pillHTML(code) {
 }
 
 function updateMain() {
-  $('#from-pill').innerHTML = pillHTML(state.from);
-  $('#to-pill').innerHTML = pillHTML(state.to);
-  if (editing !== 'main') amountInput.value = state.text;
+  setHTML(fromPill, state.from, () => pillHTML(state.from));
+  setHTML(toPill, state.to, () => pillHTML(state.to));
+  if (editing !== 'main') setValue(amountInput, state.text);
 
   const toCur = getCurrency(state.to);
   const v = valueIn(state.to);
-  const result = $('#result');
-  if (state.text.trim() === '') {
-    result.innerHTML = '<span class="result__value is-empty">0</span>';
-  } else if (Number.isFinite(v)) {
-    result.innerHTML = `<span class="result__value">${formatAmount(v, toCur)}</span><span class="result__code">${toCur.sym && toCur.sym.length <= 2 ? esc(toCur.sym) : state.to}</span>`;
-  } else {
-    result.innerHTML = '<span class="result__value is-empty">—</span>';
-  }
+  const empty = state.text.trim() === '' || !Number.isFinite(v);
+  setText(resultValue, state.text.trim() === '' ? '0' : Number.isFinite(v) ? formatAmount(v, toCur) : '—');
+  setClass(resultValue, 'is-empty', empty);
+  setText(resultCode, empty ? '' : toCur.sym && toCur.sym.length <= 2 ? toCur.sym : state.to);
 
   const r = rateOf(state.from, state.to, rates);
-  $('#rate-line').textContent = Number.isFinite(r)
+  setText(rateLine, Number.isFinite(r)
     ? `1 ${state.from} = ${formatRate(r)} ${state.to}  ·  1 ${state.to} = ${formatRate(1 / r)} ${state.from}`
-    : snapshot ? 'Курс для этой пары недоступен' : 'Загружаем курсы…';
+    : snapshot ? 'Курс для этой пары недоступен' : 'Загружаем курсы…');
 
   renderCopyMain();
 }
 
 function setPreview(el, res, code) {
-  el.classList.remove('is-error');
   if (res.ok && res.isExpression) {
-    el.textContent = `= ${formatInput(res.value, getCurrency(code))}`;
+    setText(el, `= ${formatInput(res.value, getCurrency(code))}`);
+    setClass(el, 'is-error', false);
   } else if (!res.ok && !res.empty) {
-    el.textContent = res.error;
-    el.classList.add('is-error');
+    setText(el, res.error);
+    setClass(el, 'is-error', true);
   } else {
-    el.textContent = '';
+    setText(el, '');
+    setClass(el, 'is-error', false);
   }
+}
+
+/*
+ * Ввод с клавиатуры склеивается в один пересчёт на кадр (requestAnimationFrame):
+ * при быстром наборе на слабом телефоне сетка 1→N пересчитывается не на каждый символ,
+ * а не чаще частоты обновления экрана.
+ */
+let pendingInput = null;
+let inputFrame = 0;
+
+function scheduleSourceInput(code, text, previewEl) {
+  pendingInput = { code, text, previewEl };
+  if (!inputFrame) inputFrame = requestAnimationFrame(flushSourceInput);
+}
+
+function flushSourceInput() {
+  if (inputFrame) cancelAnimationFrame(inputFrame);
+  inputFrame = 0;
+  const p = pendingInput;
+  pendingInput = null;
+  if (p) onSourceInput(p.code, p.text, p.previewEl);
 }
 
 /** Ввод в любой карточке или в главном поле: карточка становится источником. */
@@ -308,6 +399,7 @@ function onSourceInput(code, text, previewEl) {
 }
 
 function commitInput(code, input, previewEl) {
+  flushSourceInput(); // не теряем последний символ, ожидающий кадра
   if (editing === code) editing = null;
   const res = evaluate(input.value);
   if (state.from === code || code === 'main') {
@@ -318,15 +410,14 @@ function commitInput(code, input, previewEl) {
       state.text = formatInput(state.amount, getCurrency(state.from)); // откат к последнему корректному
     }
   }
-  previewEl.textContent = '';
-  previewEl.classList.remove('is-error');
-  amountPreview.textContent = '';
+  setPreview(previewEl, { ok: false, empty: true }, code);
+  setPreview(amountPreview, { ok: false, empty: true }, code);
   updateAll();
   persist();
 }
 
 amountInput.addEventListener('focus', () => { editing = 'main'; });
-amountInput.addEventListener('input', () => onSourceInput(state.from, amountInput.value, amountPreview));
+amountInput.addEventListener('input', () => scheduleSourceInput(state.from, amountInput.value, amountPreview));
 amountInput.addEventListener('blur', () => commitInput('main', amountInput, amountPreview));
 amountInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') amountInput.blur(); });
 
@@ -408,6 +499,9 @@ const copyMenu = $('#copy-menu');
 function renderCopyMain() {
   if (copyMain.classList.contains('is-copied')) return; // не перебиваем фидбек «Скопировано!»
   const f = COPY_FORMATS.find((x) => x.id === state.copyFormat);
+  // после фидбека innerHTML восстановлен из копии — сверяем фактическую подпись
+  if (copyMain._format === f.id && copyMain.querySelector('.copy-split__format')) return;
+  copyMain._format = f.id;
   copyMain.innerHTML = `${ICON_COPY}<span class="copy-label">Копировать</span><small class="copy-split__format">${f.label}</small>`;
 }
 
@@ -518,12 +612,18 @@ function chartInverted(from = state.from, to = state.to) {
   return rateOf(from, to, rates) < 0.01;
 }
 
+const chartTitle = $('#chart-title');
+const chartRate = $('#chart-rate');
+
 function updateChartHeader() {
+  const key = `${state.from}|${state.to}|${snapshot?.ts}`;
+  if (chartTitle._key === key) return;
+  chartTitle._key = key;
   const f = getCurrency(state.from);
   const t = getCurrency(state.to);
-  $('#chart-title').innerHTML = `${badgeHTML(f)}${badgeHTML(t)}<span>${state.from} → ${state.to}</span>`;
+  chartTitle.innerHTML = `${badgeHTML(f)}${badgeHTML(t)}<span>${state.from} → ${state.to}</span>`;
   const r = rateOf(state.from, state.to, rates);
-  $('#chart-rate').textContent = !Number.isFinite(r) ? ''
+  chartRate.textContent = !Number.isFinite(r) ? ''
     : chartInverted() ? `1 ${state.to} = ${formatRate(1 / r)} ${state.from}`
     : `1 ${state.from} = ${formatRate(r)} ${state.to}`;
 }
@@ -537,14 +637,26 @@ function setChartChange() {
   chip.className = `chip ${ch > 0.005 ? 'chip--up' : ch < -0.005 ? 'chip--down' : ''}`;
 }
 
+/* График грузится и рисуется только когда панель рядом с экраном (на телефоне она под сеткой). */
+let chartVisible = !('IntersectionObserver' in window);
+let chartDirty = false;
+if (!chartVisible) {
+  new IntersectionObserver((entries) => {
+    chartVisible = entries.some((e) => e.isIntersecting);
+    if (chartVisible && chartDirty) loadChart();
+  }, { rootMargin: '200px 0px' }).observe($('.chart-panel'));
+}
+
 async function loadChart() {
+  if (!chartVisible) { chartDirty = true; ++chartReq; return; }
+  chartDirty = false;
   const req = ++chartReq;
   const { from, to, period } = state;
   chartHost.classList.add('is-loading');
   chartHost.classList.remove('is-error');
   chartMeta.textContent = 'Загружаем историю…';
   try {
-    const raw = await getPairSeries(from, to, period, rates);
+    const raw = await getPairSeries(from, to, period, rates, { maxPoints: LITE ? 240 : 500 });
     if (req !== chartReq) return;
     const invert = chartInverted(from, to);
     const data = invert ? { ...raw, points: raw.points.map(([t, v]) => [t, 1 / v]) } : raw;
@@ -647,7 +759,17 @@ function choose(code) {
   picker.close();
 }
 
-pickerSearch.addEventListener('input', () => { pickerState.active = 0; renderPicker(); pickerList.scrollTop = 0; });
+// Поиск: не чаще одного рендера списка на кадр
+let pickerFrame = 0;
+pickerSearch.addEventListener('input', () => {
+  if (pickerFrame) return;
+  pickerFrame = requestAnimationFrame(() => {
+    pickerFrame = 0;
+    pickerState.active = 0;
+    renderPicker();
+    pickerList.scrollTop = 0;
+  });
+});
 pickerSearch.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowDown') { e.preventDefault(); moveActive(1); }
   if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
@@ -792,7 +914,21 @@ darkQuery.addEventListener('change', applyTheme);
 
 let installPrompt = null;
 const installBtn = $('#install-btn');
+/**
+ * Кнопка «Установить» — только на десктопе (мышь/тачпад + не мобильный UA).
+ * На смартфонах и планшетах событие не перехватываем: никаких баннеров в DOM,
+ * установка остаётся доступной через штатное меню браузера.
+ */
+function isDesktopDevice() {
+  const finePointer = matchMedia('(hover: hover) and (pointer: fine)').matches;
+  const mobileUA = navigator.userAgentData?.mobile
+    ?? /Android|iPhone|iPad|iPod|Mobile|Tablet|Silk|Kindle|HarmonyOS|OpenHarmony/i.test(navigator.userAgent);
+  const iPadOS = /Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1;
+  return finePointer && !mobileUA && !iPadOS;
+}
+
 window.addEventListener('beforeinstallprompt', (e) => {
+  if (!isDesktopDevice()) return;
   e.preventDefault();
   installPrompt = e;
   installBtn.hidden = false;
@@ -816,9 +952,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname))) {
-  window.addEventListener('load', () => {
+  // Регистрация после load и в простое: установка SW и прекэш не конкурируют с первым рендером
+  window.addEventListener('load', () => idle(() => {
     navigator.serviceWorker.register('sw.js').catch((err) => console.warn('[sw]', err));
-  });
+  }, 3000));
 }
 
 /* ============================ Старт ============================ */
@@ -829,6 +966,8 @@ renderStatus();
 persist();
 refresh().then(() => { if (chartHost.classList.contains('is-error')) loadChart(); });
 loadChart();
-loadWeek()
-  .then((w) => { week = w; updateCards(); })
-  .catch((err) => { console.warn('[week]', err); week = []; updateCards(); });
+// История для спарклайнов — после первого рендера, в простое
+const renderAllSparks = () => { for (const entry of cards.values()) renderSpark(entry); };
+idle(() => loadWeek()
+  .then((w) => { week = w; renderAllSparks(); })
+  .catch((err) => { console.warn('[week]', err); week = []; renderAllSparks(); }));

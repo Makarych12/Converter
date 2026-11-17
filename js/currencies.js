@@ -173,6 +173,13 @@ function buildFiat(code) {
   };
 }
 
+const RE_WORD_SPLIT = /[\s,()-]+/;
+/** Слова для поиска по префиксу считаются один раз при построении справочника. */
+function withWords(cur) {
+  cur.words = cur.search.split(RE_WORD_SPLIT).filter(Boolean);
+  return cur;
+}
+
 function buildOther(item, kind) {
   return {
     ...item, kind, symbols: [item.sym], flag: '',
@@ -183,9 +190,9 @@ function buildOther(item, kind) {
 
 /** @type {Map<string, any>} */
 export const CURRENCIES = new Map();
-for (const code of FIAT_CODES) CURRENCIES.set(code, buildFiat(code));
-for (const c of CRYPTO) CURRENCIES.set(c.code, buildOther(c, 'crypto'));
-for (const m of METALS) CURRENCIES.set(m.code, buildOther(m, 'metal'));
+for (const code of FIAT_CODES) CURRENCIES.set(code, withWords(buildFiat(code)));
+for (const c of CRYPTO) CURRENCIES.set(c.code, withWords(buildOther(c, 'crypto')));
+for (const m of METALS) CURRENCIES.set(m.code, withWords(buildOther(m, 'metal')));
 
 export function getCurrency(code) {
   return CURRENCIES.get(String(code || '').toUpperCase()) || null;
@@ -217,7 +224,7 @@ export function searchCurrencies(query, kind = 'all') {
       score = 90;
     } else if (cur.code.startsWith(qUpper)) {
       score = 80;
-    } else if (cur.search.split(/[\s,()-]+/).some((w) => w.startsWith(q))) {
+    } else if (cur.words.some((w) => w.startsWith(q))) {
       score = 60;
     } else if (cur.search.includes(q)) {
       score = 40;

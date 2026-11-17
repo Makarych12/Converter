@@ -26,16 +26,33 @@ const OP_ALIASES = {
   '＋': '+',
 };
 
+// Регулярные выражения скомпилированы один раз на модуль, а не на каждый вызов
+const RE_SEPARATORS = /[\s   '’_]/g;   // пробелы, апострофы, подчёркивания — разряды
+const RE_OP_ALIASES = /[×·∙xXхХ÷:−–—＋]/g; // × · ∙ x х ÷ : − – — ＋
+const RE_DOTS = /\./g;
+const RE_COMMAS = /,/g;
+const RE_THOUSANDS = /[kKкК]/;
+const OPERATORS = '+-*/^%()';
+const replaceAlias = (ch) => OP_ALIASES[ch];
+
 function normalize(input) {
-  return String(input ?? '')
-    // все виды пробелов, апострофы и подчёркивания как разделители разрядов
-    .replace(/[\s   '’_]/g, '')
-    .replace(/[×·∙xXхХ÷:−–—＋]/g, (ch) => OP_ALIASES[ch]);
+  return String(input ?? '').replace(RE_SEPARATORS, '').replace(RE_OP_ALIASES, replaceAlias);
 }
 
+const countChar = (str, code) => {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) if (str.charCodeAt(i) === code) n++;
+  return n;
+};
+
+/** 0-9 . , — без регулярки на каждый символ */
+const isNumChar = (c) => (c >= 48 && c <= 57) || c === 46 || c === 44;
+/** k K к К */
+const isThousands = (c) => c === 107 || c === 75 || c === 1082 || c === 1050;
+
 function parseNumberLiteral(raw, pos) {
-  const dots = (raw.match(/\./g) || []).length;
-  const commas = (raw.match(/,/g) || []).length;
+  const dots = countChar(raw, 46);
+  const commas = countChar(raw, 44);
   let s = raw;
 
   if (dots && commas) {
@@ -43,16 +60,16 @@ function parseNumberLiteral(raw, pos) {
     const decimal = raw.lastIndexOf('.') > raw.lastIndexOf(',') ? '.' : ',';
     const group = decimal === '.' ? ',' : '.';
     s = raw.split(group).join('');
-    if ((s.match(decimal === '.' ? /\./g : /,/g) || []).length > 1) {
+    if (countChar(s, decimal.charCodeAt(0)) > 1) {
       throw new ParseError(`Некорректное число «${raw}»`, pos);
     }
     s = s.replace(',', '.');
   } else if (commas > 1) {
-    s = raw.replace(/,/g, '');           // 1,000,000
+    s = raw.replace(RE_COMMAS, '');      // 1,000,000
   } else if (commas === 1) {
     s = raw.replace(',', '.');           // 1,5 — десятичная запятая
   } else if (dots > 1) {
-    s = raw.replace(/\./g, '');          // 1.000.000
+    s = raw.replace(RE_DOTS, '');        // 1.000.000
   }
 
   if (s === '.' || s === '') throw new ParseError(`Некорректное число «${raw}»`, pos);
@@ -66,19 +83,19 @@ function tokenize(src) {
   let i = 0;
   while (i < src.length) {
     const ch = src[i];
-    if (/[0-9.,]/.test(ch)) {
+    if (isNumChar(src.charCodeAt(i))) {
       const start = i;
-      while (i < src.length && /[0-9.,]/.test(src[i])) i++;
+      while (i < src.length && isNumChar(src.charCodeAt(i))) i++;
       let value = parseNumberLiteral(src.slice(start, i), start);
       // суффикс тысяч
-      if (i < src.length && /[kKкК]/.test(src[i])) {
+      if (i < src.length && isThousands(src.charCodeAt(i))) {
         value *= 1000;
         i++;
       }
       tokens.push({ type: 'num', value, pos: start });
       continue;
     }
-    if ('+-*/^%()'.includes(ch)) {
+    if (OPERATORS.includes(ch)) {
       tokens.push({ type: ch, pos: i });
       i++;
       continue;
@@ -188,9 +205,27 @@ function settle(node) {
  * @returns {{ok: true, value: number, isExpression: boolean} |
  *           {ok: false, empty?: boolean, error?: string, position?: number}}
  */
+// Маленький LRU-кэш: повторный ввод того же текста (Backspace, пересчёт при blur) не разбирается заново
+const CACHE_LIMIT = 64;
+const cache = new Map();
+
 export function evaluate(input) {
+  const key = String(input ?? '');
+  const hit = cache.get(key);
+  if (hit) {
+    cache.delete(key);
+    cache.set(key, hit); // освежаем позицию в LRU
+    return hit;
+  }
+  const result = evaluateUncached(key);
+  cache.set(key, result);
+  if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+  return result;
+}
+
+function evaluateUncached(input) {
   const src = normalize(input);
-  if (!src) return { ok: false, empty: true };
+  if (!src) return Object.freeze({ ok: false, empty: true });
   try {
     const tokens = tokenize(src);
     const parser = new Parser(tokens);
@@ -203,10 +238,10 @@ export function evaluate(input) {
     if (!Number.isFinite(value)) throw new ParseError('Результат не является числом');
     // «Выражение» — всё, что не является просто числом (в т.ч. с ведущим минусом)
     const isExpression = !(tokens.length === 1 || (tokens.length === 2 && tokens[0].type === '-' && tokens[1].type === 'num'))
-      || /[kKкК]/.test(src);
-    return { ok: true, value, isExpression };
+      || RE_THOUSANDS.test(src);
+    return Object.freeze({ ok: true, value, isExpression });
   } catch (err) {
-    if (err instanceof ParseError) return { ok: false, error: err.message, position: err.position };
+    if (err instanceof ParseError) return Object.freeze({ ok: false, error: err.message, position: err.position });
     throw err;
   }
 }

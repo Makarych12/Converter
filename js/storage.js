@@ -56,3 +56,8 @@ export function lsGet(key, fallback = undefined) {
 export function lsSet(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* квота/приватный режим */ }
 }
+
+/** Запись уже сериализованной строки — без повторного JSON.stringify. */
+export function lsSetRaw(key, json) {
+  try { localStorage.setItem(key, json); } catch { /* квота/приватный режим */ }
+}

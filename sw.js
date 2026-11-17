@@ -1,6 +1,6 @@
 /* Convector service worker: офлайн-оболочка (stale-while-revalidate) + кэш ответов API (network-first). */
 
-const VERSION = 'v1';
+const VERSION = 'v2'; // v2 — оптимизация под бюджетные Android, десктопная кнопка установки
 const SHELL = `convector-shell-${VERSION}`;
 const API = `convector-api-${VERSION}`;
 
@@ -26,8 +26,14 @@ const SHELL_FILES = [
 ];
 
 const API_HOSTS = ['api.frankfurter.dev', 'cdn.jsdelivr.net', 'currency-api.pages.dev', 'api.coingecko.com'];
-const API_CACHE_LIMIT = 150;
+const API_CACHE_LIMIT = 80;
+// Датированные снапшоты Fawaz (@2026-11-10, 2026-11-10.currency-api…) неизменны и уже лежат в IndexedDB —
+// не дублируем их в Cache Storage
+const IMMUTABLE_SNAPSHOT = /currency-api@\d{4}-\d{2}-\d{2}|\/\/\d{4}-\d{2}-\d{2}\.currency-api/;
+let putsSinceTrim = 0;
 
+// Прекэш оболочки идёт в потоке Service Worker и запускается уже после load + idle на странице
+// (см. регистрацию в app.js), поэтому не конкурирует с первым рендером.
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(SHELL).then((c) => c.addAll(SHELL_FILES)).then(() => self.skipWaiting()));
 });
@@ -63,8 +69,11 @@ async function networkFirst(request) {
   try {
     const res = await fetch(request);
     if (res.ok) {
-      await cache.put(request, res.clone());
-      trim(API, API_CACHE_LIMIT);
+      // запись в кэш не задерживает ответ странице
+      const copy = res.clone();
+      cache.put(request, copy).then(() => {
+        if (++putsSinceTrim >= 20) { putsSinceTrim = 0; return trim(API, API_CACHE_LIMIT); }
+      }).catch(() => {});
     }
     return res;
   } catch (err) {
@@ -81,7 +90,8 @@ self.addEventListener('fetch', (event) => {
 
   if (url.origin === self.location.origin) {
     event.respondWith(staleWhileRevalidate(request));
-  } else if (API_HOSTS.some((h) => url.hostname === h || url.hostname.endsWith(`.${h}`))) {
+  } else if (!IMMUTABLE_SNAPSHOT.test(request.url)
+    && API_HOSTS.some((h) => url.hostname === h || url.hostname.endsWith(`.${h}`))) {
     event.respondWith(networkFirst(request));
   }
 });

@@ -184,7 +184,7 @@ function downsample(points, max = 500) {
  * Ряд курса пары: «1 from = N to».
  * @returns {Promise<{points: [number, number][], sources: string[], notes: string[], stale: boolean}>}
  */
-export async function getPairSeries(from, to, period, liveRates) {
+export async function getPairSeries(from, to, period, liveRates, { maxPoints = 500 } = {}) {
   const [a, b] = await Promise.all([cachedSeriesEUR(from, period), cachedSeriesEUR(to, period)]);
   const series = [a, b].filter((s) => s.kind === 'points');
   const notes = [];
@@ -213,7 +213,7 @@ export async function getPairSeries(from, to, period, liveRates) {
   if (lf && lt && points.length && points[points.length - 1][0] < Date.now() - 30 * 60e3) {
     points.push([Date.now(), lt / lf]);
   }
-  points = downsample(points);
+  points = downsample(points, maxPoints);
 
   const allDaily = series.length && series.every((s) => s.daily);
   if (period === '24h' && allDaily) notes.push('Внутридневных данных по фиату нет: ЕЦБ публикует курс раз в день — показаны последние фиксинги.');
